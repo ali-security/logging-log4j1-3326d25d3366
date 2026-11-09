@@ -1,0 +1,60 @@
+name: build
+
+# log4j 1.2.17 has no upstream GitHub Actions CI. This workflow reproduces the
+# project's own Maven build (pom.xml: compile -source/-target 1.4, tests run by
+# maven-antrun-plugin invoking tests/build.xml "runAll" in the test phase) on a
+# JDK 7 / Maven 3.6.1 toolchain, the same one the 1.2.17+sp2 seal used.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "tests/build.xml target to run instead of runAll (e.g. Core, Minimum, Socket); empty = full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test (mvn verify in maven:3-jdk-7)
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/m2home"
+          TARGET_ARG=""
+          if [ -n "$TEST_FILTER" ]; then TARGET_ARG="-Dlog4j.tests.target=$TEST_FILTER"; fi
+          # Run as the (non-root) runner user: ErrorHandlerTestCase.test2 expects
+          # opening /xyz/:x.log to fail, which it does not when running as root.
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --entrypoint "" \
+            -e MAVEN_CONFIG= \
+            -e HOME=/m2home \
+            -e MAVEN_OPTS="-Duser.home=/m2home -Dhttps.protocols=TLSv1.2" \
+            -v "$RUNNER_TEMP/m2home:/m2home" \
+            -v "$GITHUB_WORKSPACE:/w" -w /w \
+            maven:3-jdk-7 \
+            mvn -B clean verify -Dmaven.site.skip=true $TARGET_ARG 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Test summary
+        if: always()
+        run: |
+          awk '
+            /\[junit\] Running / { suite=$3; next }
+            /\[junit\] Tests run:/ && suite != "" {
+              gsub(",", "", $4); gsub(",", "", $6); gsub(",", "", $8);
+              printf "%-60s tests=%s failures=%s errors=%s\n", suite, $4, $6, $8;
+              run+=$4; fail+=$6; err+=$8; n++; suite=""
+            }
+            END { printf "TOTAL: %d test suites, %d tests run, %d passed, %d failures, %d errors\n", n, run, run-fail-err, fail, err }
+          ' "$RUNNER_TEMP/build.log"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: log4j-jar
+          path: target/log4j-1.2.17.jar
+          if-no-files-found: error
