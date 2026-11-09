@@ -18,11 +18,12 @@ package org.apache.log4j.jdbc;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.Iterator;
 
+import org.apache.log4j.Layout;
 import org.apache.log4j.PatternLayout;
 import org.apache.log4j.spi.ErrorCode;
 import org.apache.log4j.spi.LoggingEvent;
@@ -49,8 +50,17 @@ import org.apache.log4j.spi.LoggingEvent;
   conversion patterns in <code>PatternLayout</code> can be used
   inside of the statement.  (see the test cases for examples)
 
-  <p>Overriding the {@link #getLogStatement} method allows more
-  explicit control of the statement used for logging.
+  <p>The statement is never built by formatting the logging event into
+  SQL text, which made it vulnerable to SQL injection (CVE-2022-23305).
+  Instead, every single-quoted string literal of the statement holding
+  conversion patterns, e.g. <code>'%m'</code>, is replaced with a bind
+  variable of a {@link java.sql.PreparedStatement PreparedStatement}
+  and its formatted value is bound as a <code>String</code>.  Literals
+  without conversion patterns are kept as is.  Only
+  <code>org.apache.log4j.PatternLayout</code> is supported as layout.
+
+  <p>As of the fix for CVE-2022-23305 {@link #getLogStatement} is no
+  longer in use.
 
   <p>For use as a base class:
 
@@ -66,10 +76,6 @@ import org.apache.log4j.spi.LoggingEvent;
      generated.  Typically this would return the connection to the
      pool it came from.
 
-     <li>Override <code>getLogStatement(LoggingEvent event)</code> to
-     produce specialized or dynamic statements. The default uses the
-     sql option value.
-
     </ul>
 
     @author Kevin Steppe (<A HREF="mailto:ksteppe@pacbell.net">ksteppe@pacbell.net</A>)
@@ -77,6 +83,10 @@ import org.apache.log4j.spi.LoggingEvent;
 */
 public class JDBCAppender extends org.apache.log4j.AppenderSkeleton
     implements org.apache.log4j.Appender {
+
+  private static final IllegalArgumentException ILLEGAL_PATTERN_FOR_SECURE_EXEC =
+    new IllegalArgumentException(
+      "Only org.apache.log4j.PatternLayout is supported for now due to CVE-2022-23305");
 
   /**
    * URL of the DB for default connection handling
@@ -112,6 +122,16 @@ public class JDBCAppender extends org.apache.log4j.AppenderSkeleton
    * Also see PatternLayout.
    */
   protected String sqlStatement = "";
+
+  /**
+   * Translates the conversion pattern into a parameterized SQL statement.
+   */
+  private JdbcPatternParser preparedStatementParser;
+
+  /**
+   * Conversion pattern {@link #preparedStatementParser} was built from.
+   */
+  private String preparedStatementPattern;
 
   /**
    * size of LoggingEvent buffer before writting to the database.
@@ -187,15 +207,15 @@ public class JDBCAppender extends org.apache.log4j.AppenderSkeleton
   }
 
   /**
-   * By default getLogStatement sends the event to the required Layout object.
-   * The layout will format the given pattern into a workable SQL string.
+   * <p><b>As of the fix for CVE-2022-23305 getLogStatement is no longer
+   * in use.</b> Formatting the event into SQL text allowed SQL injection,
+   * the events are now inserted using a
+   * {@link java.sql.PreparedStatement PreparedStatement}.</p>
    *
-   * Overriding this provides direct access to the LoggingEvent
-   * when constructing the logging statement.
-   *
+   * @param event
    */
   protected String getLogStatement(LoggingEvent event) {
-    return getLayout().format(event);
+    return "";
   }
 
   /**
@@ -273,34 +293,102 @@ public class JDBCAppender extends org.apache.log4j.AppenderSkeleton
   }
 
   /**
-   * loops through the buffer of LoggingEvents, gets a
-   * sql string from getLogStatement() and sends it to execute().
+   * loops through the buffer of LoggingEvents and inserts them into the
+   * database using a {@link java.sql.PreparedStatement PreparedStatement}
+   * built from the conversion pattern, so that the data of the events is
+   * never part of the SQL text.
    * Errors are sent to the errorHandler.
-   *
-   * If a statement fails the LoggingEvent stays in the buffer!
    */
   public void flushBuffer() {
+    if (buffer.isEmpty()) {
+      return;
+    }
     //Do the actual logging
     removes.ensureCapacity(buffer.size());
-    for (Iterator i = buffer.iterator(); i.hasNext();) {
-      LoggingEvent logEvent = (LoggingEvent)i.next();
-      try {
-	    String sql = getLogStatement(logEvent);
-	    execute(sql);
-      }
-      catch (SQLException e) {
-	    errorHandler.error("Failed to excute sql", e,
-			   ErrorCode.FLUSH_FAILURE);
-      } finally {
-        removes.add(logEvent);
+    removes.addAll(buffer);
+
+    // remove from the buffer any events that are reported
+    buffer.removeAll(removes);
+
+    try {
+      flushBufferSecure(removes);
+    } finally {
+      // clear the buffer of reported events
+      removes.clear();
+    }
+  }
+
+  private void flushBufferSecure(ArrayList events) {
+    JdbcPatternParser parser = getPreparedStatementParser();
+    if (parser == null) {
+      return;
+    }
+    Connection con = null;
+    boolean useBatch = events.size() > 1;
+    try {
+      con = getConnection();
+      PreparedStatement ps = con.prepareStatement(parser.getParameterizedSql());
+      safelyInsertIntoDB(parser, events, useBatch, ps);
+    } catch (SQLException e) {
+      errorHandler.error("Failed to append messages sql", e,
+                         ErrorCode.FLUSH_FAILURE);
+    } finally {
+      if (con != null) {
+        closeConnection(con);
       }
     }
-    
-    // remove from the buffer any events that were reported
-    buffer.removeAll(removes);
-    
-    // clear the buffer of reported events
-    removes.clear();
+  }
+
+  private void safelyInsertIntoDB(JdbcPatternParser parser, ArrayList events,
+                                  boolean useBatch, PreparedStatement ps)
+      throws SQLException {
+    try {
+      for (int i = 0; i < events.size(); i++) {
+        LoggingEvent logEvent = (LoggingEvent) events.get(i);
+        try {
+          parser.setParameters(ps, logEvent);
+          if (useBatch) {
+            ps.addBatch();
+          }
+        } catch (SQLException e) {
+          errorHandler.error("Failed to append parameters", e,
+                             ErrorCode.FLUSH_FAILURE);
+        }
+      }
+      if (useBatch) {
+        ps.executeBatch();
+      } else {
+        ps.execute();
+      }
+    } finally {
+      try {
+        ps.close();
+      } catch (SQLException ignored) {
+      }
+    }
+  }
+
+  /**
+   * Returns the parser translating the conversion pattern of the layout
+   * into a parameterized SQL statement, or null when the layout is not a
+   * <code>PatternLayout</code>.
+   */
+  private JdbcPatternParser getPreparedStatementParser() {
+    Layout currentLayout = getLayout();
+    String pattern = null;
+    if (currentLayout != null && currentLayout.getClass() == PatternLayout.class) {
+      pattern = ((PatternLayout) currentLayout).getConversionPattern();
+    }
+    if (pattern == null) {
+      errorHandler.error("Failed to convert pattern " + currentLayout + " to SQL",
+                         ILLEGAL_PATTERN_FOR_SECURE_EXEC, ErrorCode.MISSING_LAYOUT);
+      return null;
+    }
+    if (preparedStatementParser == null || !pattern.equals(preparedStatementPattern)) {
+      preparedStatementParser = new JdbcPatternParser(pattern);
+      preparedStatementPattern = pattern;
+    }
+    return preparedStatementParser;
   }
 
 

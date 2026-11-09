@@ -176,7 +176,7 @@
                                      LevelMatchFilter, PatternParser, 
                                      ErrorHandler,Rewrite, JNDIUtil,
                                      JMSAppender, HardenedObjectInputStream,
-                                     NTEventLogDllPath"/>
+                                     NTEventLogDllPath, JDBC"/>
 
   <!-- ================================================================= -->
   <!-- Longer unit tests                                                 -->
@@ -506,6 +506,16 @@
         <classpath refid="tests.classpath"/>
         <formatter type="plain" usefile="false"/>
         <test name="org.apache.log4j.net.HardenedObjectInputStreamTest" />
+      </junit>
+  </target>
+
+  <target name="JDBC" depends="build">
+      <junit printsummary="yes" fork="yes"
+        haltonfailure="${haltonfailure}" dir="${basedir}">
+        <classpath refid="tests.classpath"/>
+        <formatter type="plain" usefile="false"/>
+        <test name="org.apache.log4j.jdbc.JdbcAppenderTest" />
+        <test name="org.apache.log4j.jdbc.JdbcPatternParserTest" />
       </junit>
   </target>
 
